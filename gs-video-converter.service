@@ -1,0 +1,21 @@
+[Unit]
+Description=GS Video Converter Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/opt/gs-video-converter
+Environment="PATH=/opt/gs-video-converter/venv/bin"
+ExecStart=/opt/gs-video-converter/venv/bin/python /opt/gs-video-converter/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Ограничение ресурсов (опционально, раскомментируй если нужно)
+# CPUQuota=200%
+# MemoryLimit=2G
+
+[Install]
+WantedBy=multi-user.target
