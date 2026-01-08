@@ -17,19 +17,15 @@ from utils.compressor import compress_video
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Server-Optimized: Defensive workers
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=8)
+# Droplet Optimized (4 vCPU / 8GB RAM)
+# Increased workers for parallel network and processing tasks
+app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
 collector = AlbumCollector()
 
-# Dynamic Authorization
 AUTHORIZED_USERS = set(ALLOWED_USER_IDS)
 PASS = "gemstock123"
-
-# Chronological Sequential Queue
 publish_queue = asyncio.Queue()
-
-# Tracks last arrival per group for settlement
-group_metadata = {} # {gid: {"last_update": float, "first_id": int}}
+group_metadata = {}
 
 def generate_pack_id():
     now = datetime.datetime.now()
@@ -37,174 +33,160 @@ def generate_pack_id():
     rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"GS-{ts}-{rand}"
 
-async def process_media_item(i, msg: Message, pack_dir, is_visual_album, chat_id):
-    """Utility to process media. Gallery items (photo/video) are relayed instantly."""
+async def prepare_media_item(i, msg: Message, pack_dir):
+    """Parallel Stage: Concurrent Download and Compression."""
     try:
-        # User Requirement: Skip processing for gallery Photo/Video
+        # Gallery / Visual Album Path
         if msg.photo or msg.video:
-            logger.info(f"[{i+1}] Bypassing process for gallery media...")
-            # Relay using original file_id to buffer
-            for relay_attempt in range(5):
-                try:
-                    if msg.photo:
-                        m = await app.send_photo(chat_id, photo=msg.photo.file_id, disable_notification=True)
-                        return m.id, m.photo.file_id, msg.caption or ""
-                    elif msg.video:
-                        # We relay video as photo/video to maintain 'Gallery' look if needed
-                        # But if user wants a 'Pack', we might need to send as document.
-                        # However, user said "just forwarded", so we keep the type.
-                        m = await app.send_video(chat_id, video=msg.video.file_id, disable_notification=True)
-                        return m.id, m.video.file_id, msg.caption or ""
-                except FloodWait as e:
-                    await asyncio.sleep(e.value + 2)
-                except Exception as e:
-                    logger.error(f"Gallery relay failed: {e}")
-                    await asyncio.sleep(2)
-            return None
+             # Identify type for final grouping
+             m_type = "photo" if msg.photo else "video"
+             f_id = msg.photo.file_id if msg.photo else msg.video.file_id
+             return {"type": "gallery", "media_type": m_type, "file_id": f_id, "caption": msg.caption or ""}
 
-        # Requirement: Compression only for videos sent as FILES (documents)
+        # Document / File Path
         path = None
-        for attempt in range(10):
+        for attempt in range(5):
             try:
                 path = await download_media_with_progress(app, msg, pack_dir)
-                if path and os.path.exists(path) and os.path.getsize(path) > 0:
-                    break
+                if path and os.path.exists(path): break
             except FloodWait as e:
-                await asyncio.sleep(e.value + 2)
-            except Exception as e:
-                logger.error(f"Download error: {e}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(e.value + 1)
+            except Exception:
+                await asyncio.sleep(1)
 
         if not path or not os.path.exists(path): return None
         
         orig_name = msg.document.file_name if msg.document else os.path.basename(path)
-        is_video_file = msg.document and "video" in (msg.document.mime_type or "")
-        tmp_out = os.path.join(pack_dir, f"proc_{orig_name}")
+        # Determine if it's a video document that needs compression
+        is_video_doc = msg.document and "video" in (msg.document.mime_type or "")
+        proc_path = os.path.join(pack_dir, f"proc_{orig_name}")
         
-        if is_video_file:
-            success, err = await asyncio.get_running_loop().run_in_executor(None, compress_video, path, tmp_out)
-            if not success:
-                logger.error(f"FFmpeg failed. Sending original document.")
-                shutil.copy2(path, tmp_out)
+        if is_video_doc:
+            # Parallel Compression: FFmpeg will use available cores
+            success, _ = await asyncio.get_running_loop().run_in_executor(None, compress_video, path, proc_path)
+            if not success: shutil.copy2(path, proc_path)
         else:
-            shutil.copy2(path, tmp_out)
+            shutil.copy2(path, proc_path)
             
         final_path = os.path.join(pack_dir, orig_name).replace("\\", "/")
         if os.path.exists(final_path): os.remove(final_path)
-        os.rename(tmp_out, final_path)
+        os.rename(proc_path, final_path)
         
-        # Relay as Document (to maintain file list look)
-        for relay_attempt in range(5):
-            try:
-                m = await app.send_document(chat_id, document=final_path, force_document=True, disable_notification=True)
-                return m.id, m.document.file_id, msg.caption or ""
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 2)
-            except Exception as e:
-                logger.error(f"Document relay failed: {e}")
-                await asyncio.sleep(2)
-        return None
+        return {"type": "document", "path": final_path, "caption": msg.caption or ""}
     except Exception as e:
-        logger.exception(f"[{i+1}] Pipeline exception")
+        logger.error(f"Prepare fail: {e}")
+        return None
+
+async def relay_item(client, chat_id, item, is_visual_album):
+    """High-speed relay to generate stable file_ids."""
+    try:
+        if item["type"] == "gallery":
+            if item["media_type"] == "photo":
+                m = await client.send_photo(chat_id, photo=item["file_id"], disable_notification=True)
+                return m.id, m.photo.file_id, item["caption"], "photo"
+            else:
+                m = await client.send_video(chat_id, video=item["file_id"], disable_notification=True)
+                return m.id, m.video.file_id, item["caption"], "video"
+        
+        elif item["type"] == "document":
+            # If visual album mode, we treat documents as visual if possible
+            # but user said only gallery is visual, documents are documents.
+            if is_visual_album:
+                # Fallback to photo for documents in visual mode (unlikely but safe)
+                m = await client.send_photo(chat_id, photo=item["path"], disable_notification=True)
+                return m.id, m.photo.file_id, item["caption"], "photo"
+            else:
+                m = await client.send_document(chat_id, document=item["path"], force_document=True, disable_notification=True)
+                return m.id, m.document.file_id, item["caption"], "document"
+    except Exception as e:
+        logger.error(f"Relay fail: {e}")
         return None
 
 async def sequencer_worker():
-    """Ensures everything enters publish_queue in chronological ID order."""
-    logger.info("Sequencer worker active.")
     while True:
         await asyncio.sleep(1)
         if not collector.albums: continue
-        
-        sorted_gids = sorted(collector.albums.keys(), key=lambda g: group_metadata.get(g, {}).get("first_id", 0))
-        
-        for gid in sorted_gids:
+        gids = sorted(collector.albums.keys(), key=lambda g: group_metadata.get(g, {}).get("first_id", 0))
+        for gid in gids:
             meta = group_metadata.get(gid)
-            if not meta: continue
+            if not meta or (time.time() - meta["last_update"]) < 3.0: continue
+            if gid != gids[0]: break
             
-            # Settle period: 4 seconds of silence
-            if (time.time() - meta["last_update"]) > 4.0:
-                if gid != sorted_gids[0]: break # Wait for older
-                
-                msgs = collector.get_album(gid)
-                group_metadata.pop(gid, None)
-                if not msgs: continue
-                
-                if len(msgs) == 1:
-                    m = msgs[0]
-                    if m.text: await publish_queue.put({"type": "text", "msg": m})
-                    elif m.sticker: await publish_queue.put({"type": "sticker", "msg": m})
-                    else: await publish_queue.put({"type": "media_pack", "messages": msgs})
-                else:
-                    await publish_queue.put({"type": "media_pack", "messages": msgs})
-                break 
+            msgs = collector.get_album(gid)
+            group_metadata.pop(gid, None)
+            if not msgs: continue
+            
+            if len(msgs) == 1:
+                m = msgs[0]
+                if m.text: await publish_queue.put({"type": "text", "msg": m})
+                elif m.sticker: await publish_queue.put({"type": "sticker", "msg": m})
+                else: await publish_queue.put({"type": "media_pack", "messages": msgs})
+            else:
+                await publish_queue.put({"type": "media_pack", "messages": msgs})
+            break
 
 async def publisher_worker():
-    """Executes publishing and processing tasks from the queue."""
-    logger.info("Publisher worker active.")
+    logger.info("Turbo Publisher Ready.")
     while True:
         task = await publish_queue.get()
         try:
-            task_type = task.get("type")
-            if task_type == "text":
-                msg = task["msg"]
-                await app.send_message(TARGET_CHANNEL_ID, msg.text)
-                await msg.reply_text("✅ Title published.")
-            elif task_type == "sticker":
-                msg = task["msg"]
-                await app.send_sticker(TARGET_CHANNEL_ID, msg.sticker.file_id)
-                await msg.reply_text("✅ Sticker published.")
-            elif task_type == "media_pack":
+            ttype = task.get("type")
+            if ttype == "text":
+                await app.send_message(TARGET_CHANNEL_ID, task["msg"].text)
+            elif ttype == "sticker":
+                await app.send_sticker(TARGET_CHANNEL_ID, task["msg"].sticker.file_id)
+            elif ttype == "media_pack":
                 messages = task["messages"]
                 chat_id = messages[0].chat.id
-                status_msg = await messages[0].reply_text("🛰️ Processing pack...")
+                status = await messages[0].reply_text("🏎️ Turbo Processing...")
                 
-                # Check if this should be a visual album (all are gallery photo/video)
-                # or a file pack (at least one is a document).
-                any_doc = any(msg.document for msg in messages)
-                is_visual_album = not any_doc
-                
+                is_visual = not any(m.document for m in messages)
                 pack_dir = os.path.join(WORK_DIR, generate_pack_id())
                 os.makedirs(pack_dir, exist_ok=True)
-                start_time = datetime.datetime.now()
+                start = datetime.datetime.now()
 
-                try:
-                    results = []
-                    for i, m in enumerate(messages):
-                        res = await process_media_item(i, m, pack_dir, is_visual_album, chat_id)
-                        if res: results.append(res)
-                        await asyncio.sleep(1.5)
+                # STAGE 1: Parallel Compute (All cores)
+                p_tasks = [prepare_media_item(i, m, pack_dir) for i, m in enumerate(messages)]
+                prep_items = await asyncio.gather(*p_tasks)
+                
+                # STAGE 2: Sequential High-Speed Relay
+                results = []
+                for item in prep_items:
+                    if not item: continue
+                    res = await relay_item(app, chat_id, item, is_visual)
+                    if res: results.append(res)
+                    await asyncio.sleep(0.3) 
 
-                    if results:
-                        media = []
-                        for r in results:
-                            # If it was returned from a photo relay, use InputMediaPhoto
-                            # We can check the type from Pyrogram or use is_visual_album as hint
-                            if is_visual_album:
-                                # This is slightly tricky as InputMediaPhoto/Video need to match
-                                # But results[1] is just a file_id. 
-                                # We can check the original messages.
-                                orig_msg = next((m for m in messages if (m.photo and m.photo.file_id in r) or (m.video and m.video.file_id in r)), messages[0])
-                                if orig_msg.photo: media.append(InputMediaPhoto(media=r[1], caption=r[2]))
-                                else: media.append(InputMediaVideo(media=r[1], caption=r[2]))
-                            else:
-                                media.append(InputMediaDocument(media=r[1], caption=r[2]))
+                if results:
+                    # STAGE 3: Final Publish with Mixed Type Support
+                    media_grouped = []
+                    for r in results:
+                        caption = r[2]
+                        file_id = r[1]
+                        kind = r[3]
                         
-                        for offset in range(0, len(media), 10):
-                            await app.send_media_group(TARGET_CHANNEL_ID, media=media[offset:offset+10])
-                        
-                        temp_ids = [r[0] for r in results]
-                        asyncio.create_task(app.delete_messages(chat_id, temp_ids))
-                        dur = (datetime.datetime.now() - start_time).total_seconds()
-                        await status_msg.edit_text(f"✅ Published in {dur:.1f}s!")
-                    else:
-                        await status_msg.edit_text("❌ Failed.")
-                finally:
-                    shutil.rmtree(pack_dir, ignore_errors=True)
-        except Exception as e:
-            logger.exception("Publisher fail")
+                        if kind == "photo":
+                            media_grouped.append(InputMediaPhoto(media=file_id, caption=caption))
+                        elif kind == "video":
+                            media_grouped.append(InputMediaVideo(media=file_id, caption=caption))
+                        else: # document
+                            media_grouped.append(InputMediaDocument(media=file_id, caption=caption))
+                    
+                    for offset in range(0, len(media_grouped), 10):
+                        await app.send_media_group(TARGET_CHANNEL_ID, media=media_grouped[offset:offset+10])
+                    
+                    dur = (datetime.datetime.now() - start).total_seconds()
+                    await status.edit_text(f"🏁 Turbo Pack: {dur:.1f}s")
+                    asyncio.create_task(app.delete_messages(chat_id, [r[0] for r in results]))
+                else:
+                    await status.edit_text("❌ Turbo Failure.")
+                
+                shutil.rmtree(pack_dir, ignore_errors=True)
+        except Exception:
+             logger.exception("Publisher Error")
         finally:
             publish_queue.task_done()
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1)
 
 @app.on_message(filters.private & (filters.text | filters.sticker | filters.photo | filters.video | filters.document) & ~filters.command(["start", "setup", "channel"]))
 async def handle_everything(client, message):
@@ -215,29 +197,22 @@ async def handle_everything(client, message):
         group_metadata[gid] = {"first_id": message.id, "last_update": time.time()}
     else:
         group_metadata[gid]["last_update"] = time.time()
-        if message.id < group_metadata[gid]["first_id"]:
-            group_metadata[gid]["first_id"] = message.id
 
 @app.on_message(filters.command(["start", "channel", "setup"]))
 async def handle_cmds(client, message):
     args = message.command
     if len(args) > 1 and args[1] == PASS:
         AUTHORIZED_USERS.add(message.from_user.id)
-        await message.reply_text("✅ Authorized! Pure Sequence + Smart Bypass active.")
+        await message.reply_text("✅ Turbo Ready!")
         return
     if message.from_user.id not in AUTHORIZED_USERS:
-        await message.reply_text("👋 Send `/start gemstock123`.")
+        await message.reply_text("🔑 `/start gemstock123`")
         return
     if message.text.startswith("/start"):
-        await message.reply_text("👋 GS Bot Online. Order is safe.")
-    elif message.text.startswith("/channel"):
-        try:
-            chat = await app.get_chat(TARGET_CHANNEL_ID)
-            await message.reply_text(f"✅ Target: {chat.title}")
-        except: await message.reply_text("❌ Connection Error.")
+        await message.reply_text("🏎️ GS Turbo Active.")
 
 if __name__ == "__main__":
-    print("Bot started...")
+    print("Turbo Bot active...")
     loop = asyncio.get_event_loop()
     loop.create_task(sequencer_worker())
     loop.create_task(publisher_worker())
