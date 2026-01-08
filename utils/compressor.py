@@ -76,7 +76,8 @@ def compress_video(input_path, output_path, target_size_mb=12):
                     bufsize=f'{int(target_video_bitrate*2)}', 
                     an=None, 
                     preset='ultrafast', # Max speed for server
-                    threads=0 # Use all available CPU cores
+                    tune='fastdecode', # Optimized for fast decoding/encoding
+                    threads=2 # Limit to 2 threads per FFmpeg (since we run 2 FFmpegs on 4 cores)
                 )
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)

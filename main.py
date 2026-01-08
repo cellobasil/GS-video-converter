@@ -17,8 +17,9 @@ from utils.compressor import compress_video
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# STABILITY: Optimized for Cloud Droplets
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=4)
+# EXTREME SPEED: Increase workers for cloud droplet
+# workers=16 helps pyrogram maintain multiple media sessions without resets
+app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
 collector = AlbumCollector()
 
 AUTHORIZED_USERS = set(ALLOWED_USER_IDS)
@@ -26,8 +27,9 @@ PASS = "gemstock123"
 publish_queue = asyncio.Queue()
 group_metadata = {}
 
-# CPU OPTIMIZATION: One video at a time to maximize 4-core speed
-compression_semaphore = asyncio.Semaphore(1)
+# TURBO COMPRESSION: 2 concurrent tasks for 4-vCPU droplet. 
+# Each FFmpeg will take 2 cores instead of fighting for all 4.
+compression_semaphore = asyncio.Semaphore(2)
 
 def generate_pack_id():
     now = datetime.datetime.now()
@@ -36,15 +38,14 @@ def generate_pack_id():
     return f"GS-{ts}-{rand}"
 
 async def prepare_media_item(i, msg: Message, pack_dir):
-    """Semi-Parallel Stage: Download parallel, Compression throttled."""
     try:
-        # 1. Bypass Gallery (Photo/Video)
+        # 1. Gallery Bypass (0s delay)
         if msg.photo or msg.video:
              m_type = "photo" if msg.photo else "video"
              f_id = msg.photo.file_id if msg.photo else msg.video.file_id
              return {"type": "gallery", "media_type": m_type, "file_id": f_id, "caption": msg.caption or ""}
 
-        # 2. Document/File Path
+        # 2. Parallel Download
         path = None
         for attempt in range(3):
             try:
@@ -53,7 +54,7 @@ async def prepare_media_item(i, msg: Message, pack_dir):
             except FloodWait as e:
                 await asyncio.sleep(e.value + 1)
             except Exception:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
         if not path or not os.path.exists(path): return None
         
@@ -62,11 +63,12 @@ async def prepare_media_item(i, msg: Message, pack_dir):
         proc_path = os.path.join(pack_dir, f"proc_{orig_name}")
         
         if is_video_doc:
+            # TURBO LOCK: 2 videos at a time
             async with compression_semaphore:
-                logger.info(f"[{i+1}] Starting CPU Encoding: {orig_name}")
+                logger.info(f"[{i+1}] Processing Video: {orig_name}")
+                # We use a wrapper to ensure FFmpeg doesn't starve the event loop
                 success, _ = await asyncio.get_running_loop().run_in_executor(None, compress_video, path, proc_path)
                 if not success: shutil.copy2(path, proc_path)
-                logger.info(f"[{i+1}] Encoding finished: {orig_name}")
         else:
             shutil.copy2(path, proc_path)
             
@@ -80,8 +82,8 @@ async def prepare_media_item(i, msg: Message, pack_dir):
         return None
 
 async def relay_item(client, chat_id, item):
-    """Relay to generate stable file_id and identify type."""
     try:
+        # RELAY: Instant relay without sleep. We rely on Pyrogram's internal throttle.
         if item["type"] == "gallery":
             if item["media_type"] == "photo":
                 m = await client.send_photo(chat_id, photo=item["file_id"], disable_notification=True)
@@ -99,12 +101,13 @@ async def relay_item(client, chat_id, item):
 
 async def sequencer_worker():
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5) # Fast scan
         if not collector.albums: continue
         gids = sorted(collector.albums.keys(), key=lambda g: group_metadata.get(g, {}).get("first_id", 0))
         for gid in gids:
             meta = group_metadata.get(gid)
-            if not meta or (time.time() - meta["last_update"]) < 3.0: continue
+            # SETTLE TIME: Reduced to 1.2s for faster response
+            if not meta or (time.time() - meta["last_update"]) < 1.2: continue
             if gid != gids[0]: break
             
             msgs = collector.get_album(gid)
@@ -121,7 +124,7 @@ async def sequencer_worker():
             break
 
 async def publisher_worker():
-    logger.info("Balanced Publisher Ready.")
+    logger.info("Turbo Publisher Ready.")
     while True:
         task = await publish_queue.get()
         try:
@@ -133,26 +136,25 @@ async def publisher_worker():
             elif ttype == "media_pack":
                 messages = task["messages"]
                 chat_id = messages[0].chat.id
-                status = await messages[0].reply_text("⚖️ Balanced Processing...")
+                status = await messages[0].reply_text("🏎️ Extreme Processing...")
                 
                 pack_dir = os.path.join(WORK_DIR, generate_pack_id())
                 os.makedirs(pack_dir, exist_ok=True)
                 start = datetime.datetime.now()
 
-                # STAGE 1: Prepare (Downloads parallel, Compression sequential)
+                # STAGE 1: Prepare (Parallel Download & Double-Throttled Compression)
                 p_tasks = [prepare_media_item(i, m, pack_dir) for i, m in enumerate(messages)]
                 prep_items = await asyncio.gather(*p_tasks)
                 
-                # STAGE 2: Relay
+                # STAGE 2: Relay (No Sleep)
                 relay_results = []
                 for item in prep_items:
                     if not item: continue
                     res = await relay_item(app, chat_id, item)
                     if res: relay_results.append(res)
-                    await asyncio.sleep(0.5)
 
                 if relay_results:
-                    # STAGE 3: Final Grouping (Fix for ValueError: Expected DOCUMENT, got PHOTO)
+                    # STAGE 3: Final Grouping
                     media_group = []
                     for r in relay_results:
                         m_id, f_id, caption, m_kind = r
@@ -163,21 +165,23 @@ async def publisher_worker():
                         else: # document
                             media_group.append(InputMediaDocument(media=f_id, caption=caption))
                     
+                    # Final send (Large groups)
                     for offset in range(0, len(media_group), 10):
                         await app.send_media_group(TARGET_CHANNEL_ID, media=media_group[offset:offset+10])
                     
                     dur = (datetime.datetime.now() - start).total_seconds()
-                    await status.edit_text(f"🏁 Done: {dur:.1f}s")
+                    await status.edit_text(f"🏁 Extreme Time: {dur:.1f}s")
                     asyncio.create_task(app.delete_messages(chat_id, [r[0] for r in relay_results]))
                 else:
-                    await status.edit_text("❌ Failure.")
+                    await status.edit_text("❌ Failed.")
                 
                 shutil.rmtree(pack_dir, ignore_errors=True)
         except Exception:
              logger.exception("Publisher Error")
         finally:
             publish_queue.task_done()
-            await asyncio.sleep(2)
+            # Cooldown reduced to minimal for cloud stability
+            await asyncio.sleep(0.5)
 
 @app.on_message(filters.private & (filters.text | filters.sticker | filters.photo | filters.video | filters.document) & ~filters.command(["start", "setup", "channel"]))
 async def handle_everything(client, message):
@@ -194,16 +198,16 @@ async def handle_cmds(client, message):
     args = message.command
     if len(args) > 1 and args[1] == PASS:
         AUTHORIZED_USERS.add(message.from_user.id)
-        await message.reply_text("✅ Ready!")
+        await message.reply_text("✅ Turbo Ready!")
         return
     if (message.from_user.id if message.from_user else 0) not in AUTHORIZED_USERS:
         await message.reply_text("🔑 `/start gemstock123`")
         return
     if message.text.startswith("/start"):
-        await message.reply_text("⚖️ GS Balanced Active.")
+        await message.reply_text("🏎️ GS EXTREME Active.")
 
 if __name__ == "__main__":
-    print("Bot starting...")
+    print("Extreme Bot starting...")
     loop = asyncio.get_event_loop()
     loop.create_task(sequencer_worker())
     loop.create_task(publisher_worker())
