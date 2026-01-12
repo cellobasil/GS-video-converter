@@ -7,6 +7,7 @@ import logging
 import shutil
 import time
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message, InputMediaPhoto, InputMediaDocument, InputMediaVideo
 from pyrogram.errors import FloodWait
 from config import API_ID, API_HASH, BOT_TOKEN, TARGET_CHANNEL_ID, ALLOWED_USER_IDS, WORK_DIR
@@ -212,7 +213,7 @@ async def handle_cmds(client, message):
             try:
                 new_target = int(args[2])
                 set_user_channel(user_id, new_target)
-                await message.reply_text(f"🎯 Target Channel set to: `{new_target}`")
+                await message.reply_text(f"🎯 Target Channel set to: `{new_target}`", parse_mode=ParseMode.MARKDOWN)
             except ValueError:
                 await message.reply_text("❌ Invalid Channel ID format.")
         return
@@ -226,7 +227,7 @@ async def handle_cmds(client, message):
             # Check if arg is an int (channel ID)
             new_target = int(args[1])
             set_user_channel(user_id, new_target)
-            await message.reply_text(f"🎯 Target Channel updated: `{new_target}`")
+            await message.reply_text(f"🎯 Target Channel updated: `{new_target}`", parse_mode=ParseMode.MARKDOWN)
         except ValueError:
             # Not an ID, assume standard start
             await message.reply_text("GS Bot Online.")
@@ -235,16 +236,16 @@ async def handle_cmds(client, message):
     if message.text.startswith("/start"):
         # Check current channel
         curr = get_user_channel(user_id) or TARGET_CHANNEL_ID
-        await message.reply_text(f"GS Bot Online.\n🎯 Current Target: `{curr}`\n\nTo change, send: `/start <channel_id>`")
+        await message.reply_text(f"GS Bot Online.\n🎯 Current Target: `{curr}`\n\nTo change, send: `/start <channel_id>`", parse_mode=ParseMode.MARKDOWN)
 
     elif message.text.startswith("/channel"):
         try:
             curr = get_user_channel(user_id) or TARGET_CHANNEL_ID
             chat = await app.get_chat(curr)
-            await message.reply_text(f"✅ Target: {chat.title} (`{curr}`)")
+            await message.reply_text(f"✅ Target: {chat.title} (`{curr}`)", parse_mode=ParseMode.MARKDOWN)
         except: 
             curr = get_user_channel(user_id) or TARGET_CHANNEL_ID
-            await message.reply_text(f"⚠️ Target is set to `{curr}`, but I can't access it (Check Admin rights).")
+            await message.reply_text(f"⚠️ Target is set to `{curr}`, but I can't access it (Check Admin rights).", parse_mode=ParseMode.MARKDOWN)
 
 if __name__ == "__main__":
     print("Bot starting (Multi-User Channel Mode)...")
