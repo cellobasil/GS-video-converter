@@ -13,6 +13,7 @@ from config import API_ID, API_HASH, BOT_TOKEN, TARGET_CHANNEL_ID, ALLOWED_USER_
 from utils.album_handler import AlbumCollector
 from utils.downloader import download_media_with_progress
 from utils.compressor import compress_video
+from utils.user_settings import set_user_channel, get_user_channel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -118,14 +119,30 @@ async def publisher_worker():
         task = await publish_queue.get()
         try:
             ttype = task.get("type")
+            
+            # Resolve Target Channel for this Task
+            # 1. Identify User
+            user_id = None
+            if ttype == "media_pack":
+                if task["messages"]: 
+                    user_id = task["messages"][0].from_user.id
+            elif "msg" in task and task["msg"].from_user:
+                user_id = task["msg"].from_user.id
+            
+            # 2. Get Channel
+            target_chat = TARGET_CHANNEL_ID
+            if user_id:
+                custom_target = get_user_channel(user_id)
+                if custom_target:
+                    target_chat = int(custom_target)
+
             if ttype == "text":
-                await app.send_message(TARGET_CHANNEL_ID, task["msg"].text)
+                await app.send_message(target_chat, task["msg"].text)
             elif ttype == "sticker":
-                await app.send_sticker(TARGET_CHANNEL_ID, task["msg"].sticker.file_id)
+                await app.send_sticker(target_chat, task["msg"].sticker.file_id)
             elif ttype == "media_pack":
                 messages = task["messages"]
                 chat_id = messages[0].chat.id
-                # 1. Simplified status message
                 status = await messages[0].reply_text("Processing...")
                 
                 pack_dir = os.path.join(WORK_DIR, generate_pack_id())
@@ -152,14 +169,12 @@ async def publisher_worker():
                             media_group.append(InputMediaDocument(media=f_id, caption=caption))
                     
                     for offset in range(0, len(media_group), 10):
-                        await app.send_media_group(TARGET_CHANNEL_ID, media=media_group[offset:offset+10])
+                        await app.send_media_group(target_chat, media=media_group[offset:offset+10])
                     
-                    # 2. Cleanup: Delete "Processing..." message instead of editing it
                     try: 
                         await status.delete()
                     except: pass
                     
-                    # Delete intermediate relay messages
                     temp_ids = [r[0] for r in relay_results]
                     asyncio.create_task(app.delete_messages(chat_id, temp_ids))
                 else:
@@ -184,18 +199,55 @@ async def handle_everything(client, message):
 
 @app.on_message(filters.command(["start", "channel", "setup"]))
 async def handle_cmds(client, message):
+    # Args parsing
     args = message.command
+    user_id = message.from_user.id
+    
+    # Check authorization first
     if len(args) > 1 and args[1] == PASS:
-        AUTHORIZED_USERS.add(message.from_user.id)
+        AUTHORIZED_USERS.add(user_id)
         await message.reply_text("✅ Authorized!")
+        # If there's a 3rd arg, treat it as a channel ID
+        if len(args) > 2:
+            try:
+                new_target = int(args[2])
+                set_user_channel(user_id, new_target)
+                await message.reply_text(f"🎯 Target Channel set to: `{new_target}`")
+            except ValueError:
+                await message.reply_text("❌ Invalid Channel ID format.")
         return
-    if (message.from_user.id if message.from_user else 0) not in AUTHORIZED_USERS:
+
+    if user_id not in AUTHORIZED_USERS:
         return
+
+    # Handle /start <channel_id> for already authorized users
+    if message.text.startswith("/start") and len(args) > 1:
+        try:
+            # Check if arg is an int (channel ID)
+            new_target = int(args[1])
+            set_user_channel(user_id, new_target)
+            await message.reply_text(f"🎯 Target Channel updated: `{new_target}`")
+        except ValueError:
+            # Not an ID, assume standard start
+            await message.reply_text("GS Bot Online.")
+        return
+    
     if message.text.startswith("/start"):
-        await message.reply_text("GS Bot Online.")
+        # Check current channel
+        curr = get_user_channel(user_id) or TARGET_CHANNEL_ID
+        await message.reply_text(f"GS Bot Online.\n🎯 Current Target: `{curr}`\n\nTo change, send: `/start <channel_id>`")
+
+    elif message.text.startswith("/channel"):
+        try:
+            curr = get_user_channel(user_id) or TARGET_CHANNEL_ID
+            chat = await app.get_chat(curr)
+            await message.reply_text(f"✅ Target: {chat.title} (`{curr}`)")
+        except: 
+            curr = get_user_channel(user_id) or TARGET_CHANNEL_ID
+            await message.reply_text(f"⚠️ Target is set to `{curr}`, but I can't access it (Check Admin rights).")
 
 if __name__ == "__main__":
-    print("Bot starting (Clean UI Mode)...")
+    print("Bot starting (Multi-User Channel Mode)...")
     loop = asyncio.get_event_loop()
     loop.create_task(sequencer_worker())
     loop.create_task(publisher_worker())
