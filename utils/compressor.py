@@ -15,13 +15,13 @@ def get_video_info(path):
         logger.error(f"FFmpeg probe error: {e.stderr.decode() if e.stderr else str(e)}")
         return None, None
 
-def compress_video(input_path, output_path, target_size_mb=10):
+def compress_video(input_path, output_path, target_size_mb=6):
     video_stream, duration = get_video_info(input_path)
     if not duration:
         return False, "Could not determine video duration."
     
-    # Final Requirement: 10MB limit for Crystal HD quality
-    target_size_mb = 10
+    # Final Requirement: 6MB limit for Crystal HD quality
+    target_size_mb = 6
     target_video_bits = target_size_mb * 8 * 1024 * 1024
     target_video_bitrate = target_video_bits / duration
     
@@ -39,7 +39,7 @@ def compress_video(input_path, output_path, target_size_mb=10):
                   )
                   return True, None
 
-        logger.info(f"Encoding 1080p HD (10MB Target)...")
+        logger.info(f"Encoding 1080p HD (6MB Target)...")
         
         # 1. Attempt GPU Acceleration first (if available)
         try:
